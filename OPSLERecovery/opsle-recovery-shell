@@ -1,0 +1,289 @@
+#!/bin/sh
+
+set -u
+
+LOG_TAG=opsle-recovery-shell
+WORK_DIR=
+
+cleanup() {
+    if [ -n "$WORK_DIR" ] && [ -d "$WORK_DIR" ]; then
+        rm -rf "$WORK_DIR"
+    fi
+}
+
+trap cleanup 0
+trap 'exit 1' HUP INT TERM
+
+pause_menu() {
+    printf '\nPress Enter to return to the menu...'
+    IFS= read -r _ || :
+}
+
+confirm() {
+    printf '%s [y/N]: ' "$1"
+    IFS= read -r answer || return 1
+    [ "$answer" = y ] || [ "$answer" = Y ]
+}
+
+diagnostics() {
+    printf '\n=== Root filesystem ===\n'
+    df -hP /
+    df_result=$?
+    if command -v findmnt >/dev/null 2>&1; then
+        options=$(findmnt -n -o OPTIONS / 2>&1)
+        findmnt_result=$?
+        printf 'Mount options: %s\n' "$options"
+        case ",$options," in
+            *,ro,*)
+                printf 'CRITICAL: root filesystem is mounted read-only.\n'
+                df_result=1
+                ;;
+            *) : ;;
+        esac
+    else
+        findmnt_result=0
+        printf 'findmnt is unavailable; could not check read-only mount status.\n'
+    fi
+
+    printf '\n=== Failed systemd units ===\n'
+    systemctl --failed --no-legend --plain --no-pager
+    units_result=$?
+    printf '\n=== Critical service ===\n'
+    if systemctl is-active --quiet systemd-journald.service; then
+        printf 'systemd-journald.service is active.\n'
+    else
+        printf 'CRITICAL: systemd-journald.service is not active.\n'
+        units_result=1
+    fi
+
+    if [ "$df_result" -eq 0 ] && [ "$findmnt_result" -eq 0 ] && [ "$units_result" -eq 0 ]; then
+        printf '\nResult: diagnostic commands completed. Review any warnings above.\n'
+    else
+        printf '\nResult: one or more diagnostic checks reported a problem.\n'
+    fi
+}
+
+repair_verified_files() {
+    WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/opsle-recovery.XXXXXX") || {
+        printf 'Could not create a temporary directory for the verification report.\n'
+        return
+    }
+
+    printf '\nChecking Debian package files with dpkg --verify...\n'
+    dpkg --verify >"$WORK_DIR/verify.log" 2>"$WORK_DIR/verify.err"
+    verify_result=$?
+    printf '%s\n' '--- Verification log ---'
+    cat "$WORK_DIR/verify.log"
+    if [ -s "$WORK_DIR/verify.err" ]; then
+        printf '%s\n' '--- Verification messages ---'
+        cat "$WORK_DIR/verify.err"
+    fi
+    if [ "$verify_result" -ne 0 ]; then
+        printf '\nResult: dpkg verification failed with exit code %s.\n' "$verify_result"
+        cleanup
+        WORK_DIR=
+        return
+    fi
+
+    : >"$WORK_DIR/files"
+    : >"$WORK_DIR/packages"
+    : >"$WORK_DIR/unowned"
+    while IFS= read -r line || [ -n "$line" ]; do
+        path=$(printf '%s\n' "$line" | sed 's/^[^ ]* *//')
+        case "$path" in
+            /*) ;;
+            *) continue ;;
+        esac
+        printf '%s\n' "$path" >>"$WORK_DIR/files"
+        owner_output=$(dpkg-query -S "$path" 2>/dev/null)
+        owner_result=$?
+        if [ "$owner_result" -eq 0 ]; then
+            printf '%s\n' "$owner_output" |
+                sed -n 's/: .*$//p' >>"$WORK_DIR/packages"
+        else
+            printf '%s\n' "$path" >>"$WORK_DIR/unowned"
+        fi
+    done <"$WORK_DIR/verify.log"
+
+    if [ ! -s "$WORK_DIR/files" ]; then
+        printf 'dpkg found no modified files with verification metadata.\n'
+        printf 'This does not verify unowned files or files without stored checksums.\n'
+        cleanup
+        WORK_DIR=
+        return
+    fi
+
+    printf '\nFiles differing from package records:\n'
+    cat "$WORK_DIR/files"
+    if [ -s "$WORK_DIR/unowned" ]; then
+        printf '\nFiles without a package owner will not be changed:\n'
+        cat "$WORK_DIR/unowned"
+    fi
+
+    sort -u "$WORK_DIR/packages" -o "$WORK_DIR/packages"
+    if [ ! -s "$WORK_DIR/packages" ]; then
+        printf '\nResult: no owning packages were identified; no files were changed.\n'
+        cleanup
+        WORK_DIR=
+        return
+    fi
+
+    printf '\nPackages to reinstall:\n'
+    cat "$WORK_DIR/packages"
+    printf 'Modified configuration files are preserved where possible.\n'
+    if ! confirm 'Reinstall these packages now?'; then
+        printf '\nResult: cancelled; no packages were changed.\n'
+        cleanup
+        WORK_DIR=
+        return
+    fi
+
+    set --
+    while IFS= read -r package || [ -n "$package" ]; do
+        [ -n "$package" ] && set -- "$@" "$package"
+    done <"$WORK_DIR/packages"
+    printf '\nReinstall log:\n'
+    DEBIAN_FRONTEND=noninteractive apt-get \
+        -o 'Dpkg::Options::=--force-confold' \
+        --reinstall install -y "$@"
+    repair_result=$?
+    if [ "$repair_result" -eq 0 ]; then
+        printf '\nResult: package reinstall completed. Run the check again to verify.\n'
+    else
+        printf '\nResult: package reinstall failed with exit code %s.\n' "$repair_result"
+    fi
+    cleanup
+    WORK_DIR=
+}
+
+repair_packages() {
+    printf '\nThis runs dpkg --configure -a and apt-get -f install -y.\n'
+    printf 'APT may install, upgrade, or remove packages.\n'
+    if ! confirm 'Continue?'; then
+        printf '\nResult: cancelled; no packages were changed.\n'
+        return
+    fi
+
+    printf '\n=== dpkg --configure -a ===\n'
+    dpkg --configure -a
+    dpkg_result=$?
+    if [ "$dpkg_result" -ne 0 ]; then
+        printf '\nResult: dpkg configuration failed with exit code %s; apt repair was not run.\n' "$dpkg_result"
+        return
+    fi
+    printf '\n=== apt-get -f install -y ===\n'
+    DEBIAN_FRONTEND=noninteractive apt-get -f install -y
+    apt_result=$?
+    if [ "$apt_result" -eq 0 ]; then
+        printf '\nResult: package repair completed successfully.\n'
+    else
+        printf '\nResult: apt repair failed with exit code %s.\n' "$apt_result"
+    fi
+}
+
+reboot_system() {
+    if ! confirm 'Reboot the computer now? Unsaved work may be lost.'; then
+        printf 'Result: cancelled.\n'
+        return
+    fi
+    printf '\nRequesting reboot...\n'
+    systemctl --no-block reboot
+    result=$?
+    if [ "$result" -eq 0 ]; then
+        printf 'Result: reboot request accepted.\n'
+    else
+        printf 'Result: reboot request failed with exit code %s.\n' "$result"
+    fi
+}
+
+console() {
+    while :; do
+        printf '\nOPSLE DEBIAN RECOVERY (POSIX SHELL)\n'
+        printf '===================================\n'
+        printf '1. Run system diagnostics\n'
+        printf '2. Check and repair modified package files\n'
+        printf '3. Repair interrupted or broken package installations\n'
+        printf '4. Reboot\n'
+        printf '5. Reinstall information\n'
+        printf '0. Exit\n'
+        printf 'Select an option: '
+        IFS= read -r choice || return 0
+
+        case "$choice" in
+            1) diagnostics; pause_menu ;;
+            2) repair_verified_files; pause_menu ;;
+            3) repair_packages; pause_menu ;;
+            4) reboot_system; pause_menu ;;
+            5)
+                printf '\nA full Debian reinstall requires Debian 13 installation media.\n'
+                printf 'Back up important data first; reinstalling can erase selected disks.\n'
+                printf 'This tool never partitions disks or starts an unattended reinstall.\n'
+                pause_menu
+                ;;
+            0) return 0 ;;
+            *) printf 'Invalid selection.\n' ;;
+        esac
+    done
+}
+
+monitor() {
+    logger -t "$LOG_TAG" "Python recovery monitor is unavailable; using shell fallback."
+    rescue_requested=0
+    while :; do
+        critical=0
+        if ! df -P / >/dev/null 2>&1; then
+            logger -t "$LOG_TAG" "CRITICAL: unable to inspect root filesystem."
+            critical=1
+        else
+            used=$(df -P / | awk 'NR == 2 { gsub(/%/, "", $5); print $5 }')
+            case "$used" in
+                ''|*[!0-9]*)
+                    logger -t "$LOG_TAG" "CRITICAL: could not read root filesystem usage."
+                    critical=1
+                    ;;
+                *)
+                    if [ "$used" -ge 98 ]; then
+                        logger -t "$LOG_TAG" "CRITICAL: root filesystem is ${used}% full."
+                        critical=1
+                    fi
+                    ;;
+            esac
+        fi
+
+        if command -v findmnt >/dev/null 2>&1; then
+            options=$(findmnt -n -o OPTIONS / 2>/dev/null) || options=
+            case ",$options," in
+                *,ro,*)
+                    logger -t "$LOG_TAG" "CRITICAL: root filesystem is mounted read-only."
+                    critical=1
+                    ;;
+            esac
+        fi
+
+        if ! systemctl is-active --quiet systemd-journald.service; then
+            logger -t "$LOG_TAG" "CRITICAL: systemd-journald.service is not active."
+            critical=1
+        fi
+
+        if [ "$critical" -eq 1 ] && [ "$rescue_requested" -eq 0 ]; then
+            logger -t "$LOG_TAG" "Switching to rescue.target."
+            if systemctl isolate rescue.target; then
+                rescue_requested=1
+            else
+                logger -t "$LOG_TAG" "Could not switch to rescue.target."
+            fi
+        fi
+        sleep 30
+    done
+}
+
+case "${1:-}" in
+    --monitor) monitor ;;
+    --help|-h)
+        printf 'Usage: %s [--console|--monitor]\n' "$0"
+        printf '  --console  start the text recovery menu (default)\n'
+        printf '  --monitor  run the Python-independent health monitor\n'
+        ;;
+    ''|--console) console ;;
+    *) printf 'Unknown option: %s\n' "$1" >&2; exit 2 ;;
+esac

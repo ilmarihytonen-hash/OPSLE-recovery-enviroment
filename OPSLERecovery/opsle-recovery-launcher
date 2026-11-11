@@ -1,0 +1,17 @@
+#!/bin/sh
+
+PYTHON=/usr/bin/python3
+SHELL_RECOVERY=/opt/opsle-recovery/opsle-recovery-shell
+
+if [ -x "$PYTHON" ]; then
+    "$PYTHON" -m opsle_recovery
+    result=$?
+    if [ "$result" -eq 0 ]; then
+        exit 0
+    fi
+    logger -t opsle-recovery "Python monitor exited with status $result; starting shell fallback."
+else
+    logger -t opsle-recovery "Python 3 is unavailable; starting shell fallback."
+fi
+
+exec "$SHELL_RECOVERY" --monitor

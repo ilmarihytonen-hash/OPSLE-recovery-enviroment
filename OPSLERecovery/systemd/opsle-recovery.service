@@ -1,0 +1,21 @@
+[Unit]
+Description=OPSLE Debian Recovery Monitor
+Documentation=file:/opt/opsle-recovery/README.md
+After=local-fs.target systemd-journald.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/opsle-recovery
+ExecStart=/opt/opsle-recovery/opsle-recovery-launcher
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+UMask=0077
+PrivateTmp=true
+ProtectHome=true
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=multi-user.target rescue.target

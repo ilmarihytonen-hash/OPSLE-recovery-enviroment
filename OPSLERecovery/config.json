@@ -1,0 +1,12 @@
+{
+  "check_interval_seconds": 30,
+  "warning_free_percent": 10,
+  "critical_free_percent": 2,
+  "warning_inode_free_percent": 10,
+  "critical_inode_free_percent": 2,
+  "auto_isolate_rescue_target": true,
+  "auto_isolate_rescue_target": true,
+  "critical_units": [
+    "systemd-journald.service"
+  ]
+}
