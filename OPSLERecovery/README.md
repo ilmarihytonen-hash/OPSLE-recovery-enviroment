@@ -29,6 +29,14 @@ This console uses `/bin/sh` and standard Debian tools only; it does not depend o
 
 For the Python monitor, set `auto_isolate_rescue_target` to `false` in `/etc/opsle-recovery/config.json` to log critical faults without automatically switching targets. The Python-independent shell fallback uses its built-in checks and always requests `rescue.target` on a critical fault.
 
+To manually switch a running Debian system into minimal rescue mode from a shell, run:
+
+```sh
+sudo /opt/opsle-recovery/opsle-recovery-shell --rescue
+```
+
+Confirm the prompt to switch to `rescue.target`. This stops normal multi-user services and may close the current terminal session. At the rescue login prompt, start the recovery menu with `/opt/opsle-recovery/opsle-recovery-shell`.
+
 ## Manually enter recovery at startup
 
 The service recognizes a one-boot kernel option, so you can manually request recovery without changing the bootloader configuration:
@@ -53,7 +61,7 @@ Copy this project to the Debian 13 computer, then run:
 sudo ./install.sh
 ```
 
-No packages are installed by the script. It installs the service under `/opt/opsle-recovery`, creates `/etc/opsle-recovery/config.json`, and enables the service for normal and rescue boots.
+No packages are installed by the script. It stages the new files, stops the existing service if it is running, replaces the complete `/opt/opsle-recovery` installation, and starts the updated service. Existing configuration at `/etc/opsle-recovery/config.json` is preserved.
 
 Check service status and logs:
 

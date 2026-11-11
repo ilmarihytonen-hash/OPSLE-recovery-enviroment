@@ -196,6 +196,32 @@ reboot_system() {
     fi
 }
 
+enter_rescue_mode() {
+    if [ "$(id -u)" -ne 0 ]; then
+        printf 'Entering rescue mode requires root privileges. Run this command with sudo.\n'
+        return 1
+    fi
+    if ! command -v systemctl >/dev/null 2>&1; then
+        printf 'systemctl is unavailable; cannot switch to rescue.target.\n'
+        return 1
+    fi
+    printf 'Switching to rescue.target stops normal multi-user services and may close this session.\n'
+    if ! confirm 'Continue to minimal rescue mode?'; then
+        printf 'Result: cancelled; the current system target is unchanged.\n'
+        return 0
+    fi
+    printf '\nRequesting rescue.target...\n'
+    systemctl isolate rescue.target
+    result=$?
+    if [ "$result" -eq 0 ]; then
+        printf 'Result: rescue.target activated.\n'
+        printf 'At the rescue prompt, run: /opt/opsle-recovery/opsle-recovery-shell\n'
+        return 0
+    fi
+    printf 'Result: could not activate rescue.target (exit code %s).\n' "$result"
+    return 1
+}
+
 console() {
     while :; do
         printf '\nOPSLE DEBIAN RECOVERY (POSIX SHELL)\n'
@@ -205,6 +231,7 @@ console() {
         printf '3. Repair interrupted or broken package installations\n'
         printf '4. Reboot\n'
         printf '5. Reinstall information\n'
+        printf '6. Enter minimal rescue mode\n'
         printf '0. Exit\n'
         printf 'Select an option: '
         IFS= read -r choice || return 0
@@ -220,6 +247,7 @@ console() {
                 printf 'This tool never partitions disks or starts an unattended reinstall.\n'
                 pause_menu
                 ;;
+            6) enter_rescue_mode; pause_menu ;;
             0) return 0 ;;
             *) printf 'Invalid selection.\n' ;;
         esac
@@ -279,10 +307,12 @@ monitor() {
 
 case "${1:-}" in
     --monitor) monitor ;;
+    --rescue) enter_rescue_mode ;;
     --help|-h)
-        printf 'Usage: %s [--console|--monitor]\n' "$0"
+        printf 'Usage: %s [--console|--monitor|--rescue]\n' "$0"
         printf '  --console  start the text recovery menu (default)\n'
         printf '  --monitor  run the Python-independent health monitor\n'
+        printf '  --rescue   request a switch to systemd rescue.target\n'
         ;;
     ''|--console) console ;;
     *) printf 'Unknown option: %s\n' "$1" >&2; exit 2 ;;
